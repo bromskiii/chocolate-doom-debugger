@@ -19,6 +19,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "SDL.h"
 #include "SDL_opengl.h"
@@ -205,6 +206,541 @@ unsigned int joywait = 0;
 static const unsigned int *icon_data;
 static int icon_w;
 static int icon_h;
+
+#define DEVPANEL_MAX_TICS 192
+
+static boolean devpanel_enabled = false;
+static boolean devpanel_paused = false;
+static boolean devpanel_edit_mode = false;
+static boolean devpanel_seek_mode = false;
+static int devpanel_current_tic = 0;
+static int devpanel_total_tics = 0;
+static char devpanel_status[96];
+static i_devpanel_tic_t devpanel_tics[DEVPANEL_MAX_TICS];
+static int devpanel_tics_count = 0;
+static int devpanel_tics_write = 0;
+static int devpanel_focus_tic = 0;
+static int devpanel_focus_tic_size = 0;
+static byte devpanel_focus_current[5];
+static byte devpanel_focus_original[5];
+static boolean devpanel_focus_has_original = false;
+static boolean devpanel_focus_edited = false;
+
+typedef struct
+{
+    char ch;
+    byte rows[7];
+} panel_glyph_t;
+
+static const panel_glyph_t panel_font[] = {
+    { ' ', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+    { '-', { 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00 } },
+    { '+', { 0x00, 0x04, 0x04, 0x1f, 0x04, 0x04, 0x00 } },
+    { '.', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c } },
+    { ',', { 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c, 0x08 } },
+    { ':', { 0x00, 0x0c, 0x0c, 0x00, 0x0c, 0x0c, 0x00 } },
+    { '/', { 0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00 } },
+    { '>', { 0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10 } },
+    { '[', { 0x0e, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0e } },
+    { ']', { 0x0e, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0e } },
+    { '(', { 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02 } },
+    { ')', { 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08 } },
+    { '*', { 0x00, 0x15, 0x0e, 0x1f, 0x0e, 0x15, 0x00 } },
+    { '=', { 0x00, 0x00, 0x1f, 0x00, 0x1f, 0x00, 0x00 } },
+    { '0', { 0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e } },
+    { '1', { 0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e } },
+    { '2', { 0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f } },
+    { '3', { 0x1e, 0x01, 0x01, 0x0e, 0x01, 0x01, 0x1e } },
+    { '4', { 0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02 } },
+    { '5', { 0x1f, 0x10, 0x10, 0x1e, 0x01, 0x01, 0x1e } },
+    { '6', { 0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e } },
+    { '7', { 0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 } },
+    { '8', { 0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e } },
+    { '9', { 0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x1c } },
+    { 'A', { 0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11 } },
+    { 'B', { 0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e } },
+    { 'C', { 0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e } },
+    { 'D', { 0x1c, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1c } },
+    { 'E', { 0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f } },
+    { 'F', { 0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10 } },
+    { 'G', { 0x0e, 0x11, 0x10, 0x10, 0x13, 0x11, 0x0e } },
+    { 'H', { 0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11 } },
+    { 'I', { 0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e } },
+    { 'J', { 0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0e } },
+    { 'K', { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 } },
+    { 'L', { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f } },
+    { 'M', { 0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11 } },
+    { 'N', { 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 } },
+    { 'O', { 0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e } },
+    { 'P', { 0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10 } },
+    { 'Q', { 0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d } },
+    { 'R', { 0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11 } },
+    { 'S', { 0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e } },
+    { 'T', { 0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 } },
+    { 'U', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e } },
+    { 'V', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04 } },
+    { 'W', { 0x11, 0x11, 0x11, 0x15, 0x15, 0x1b, 0x11 } },
+    { 'X', { 0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11 } },
+    { 'Y', { 0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04 } },
+    { 'Z', { 0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f } }
+};
+
+static int GetDevPanelWidth(int renderer_width)
+{
+    int panel_width;
+
+    panel_width = renderer_width / 3;
+
+    if (panel_width < 220)
+    {
+        panel_width = 220;
+    }
+
+    if (panel_width > renderer_width - 160)
+    {
+        panel_width = renderer_width - 160;
+    }
+
+    return panel_width;
+}
+
+static const panel_glyph_t *GetPanelGlyph(char ch)
+{
+    unsigned int i;
+    char upper;
+
+    upper = (char) toupper((unsigned char) ch);
+
+    for (i = 0; i < arrlen(panel_font); ++i)
+    {
+        if (panel_font[i].ch == upper)
+        {
+            return &panel_font[i];
+        }
+    }
+
+    return &panel_font[0];
+}
+
+static void DrawPanelChar(int x, int y, int scale,
+                          byte r, byte g, byte b, char ch)
+{
+    const panel_glyph_t *glyph;
+    int row;
+
+    glyph = GetPanelGlyph(ch);
+
+    SDL_SetRenderDrawColor(renderer, r, g, b, SDL_ALPHA_OPAQUE);
+
+    for (row = 0; row < 7; ++row)
+    {
+        int col;
+
+        for (col = 0; col < 5; ++col)
+        {
+            if ((glyph->rows[row] & (1 << (4 - col))) != 0)
+            {
+                SDL_Rect pixel;
+                pixel.x = x + col * scale;
+                pixel.y = y + row * scale;
+                pixel.w = scale;
+                pixel.h = scale;
+                SDL_RenderFillRect(renderer, &pixel);
+            }
+        }
+    }
+}
+
+static void DrawPanelText(int x, int y, int scale,
+                          byte r, byte g, byte b, const char *text)
+{
+    int cursor_x;
+
+    if (text == NULL)
+    {
+        return;
+    }
+
+    cursor_x = x;
+
+    while (*text != '\0')
+    {
+        DrawPanelChar(cursor_x, y, scale, r, g, b, *text);
+        cursor_x += 6 * scale;
+        ++text;
+    }
+}
+
+static void BuildButtonSummary(char *buffer, size_t buffer_len, int buttons)
+{
+    if ((buttons & BT_CHANGE) != 0)
+    {
+        M_snprintf(buffer, buffer_len, "BTN %02X ATK %d USE %d WEP %d",
+                   buttons,
+                   (buttons & BT_ATTACK) != 0,
+                   (buttons & BT_USE) != 0,
+                   ((buttons & BT_WEAPONMASK) >> BT_WEAPONSHIFT) + 1);
+    }
+    else
+    {
+        M_snprintf(buffer, buffer_len, "BTN %02X ATK %d USE %d WEP -",
+                   buttons,
+                   (buttons & BT_ATTACK) != 0,
+                   (buttons & BT_USE) != 0);
+    }
+}
+
+void I_DevPanelSetEnabled(boolean enabled)
+{
+    devpanel_enabled = enabled;
+
+    if (!enabled)
+    {
+        devpanel_tics_count = 0;
+        devpanel_tics_write = 0;
+        devpanel_focus_tic = 0;
+        devpanel_focus_tic_size = 0;
+        devpanel_focus_has_original = false;
+        devpanel_focus_edited = false;
+    }
+}
+
+void I_DevPanelSetFlags(boolean paused, boolean edit_mode, boolean seek_mode)
+{
+    devpanel_paused = paused;
+    devpanel_edit_mode = edit_mode;
+    devpanel_seek_mode = seek_mode;
+}
+
+void I_DevPanelSetTimeline(int current_tic, int total_tics)
+{
+    devpanel_current_tic = current_tic;
+    devpanel_total_tics = total_tics;
+}
+
+void I_DevPanelSetStatus(const char *status)
+{
+    if (status != NULL)
+    {
+        M_StringCopy(devpanel_status, status, sizeof(devpanel_status));
+    }
+    else
+    {
+        devpanel_status[0] = '\0';
+    }
+}
+
+void I_DevPanelPushTic(i_devpanel_tic_t tic)
+{
+    devpanel_tics[devpanel_tics_write] = tic;
+    devpanel_tics_write = (devpanel_tics_write + 1) % DEVPANEL_MAX_TICS;
+
+    if (devpanel_tics_count < DEVPANEL_MAX_TICS)
+    {
+        ++devpanel_tics_count;
+    }
+}
+
+void I_DevPanelMarkTicEdited(int tic)
+{
+    int i;
+
+    for (i = 0; i < devpanel_tics_count; ++i)
+    {
+        int idx = (devpanel_tics_write - 1 - i + DEVPANEL_MAX_TICS)
+                % DEVPANEL_MAX_TICS;
+
+        if (devpanel_tics[idx].tic == tic)
+        {
+            devpanel_tics[idx].edited = true;
+            break;
+        }
+    }
+}
+
+void I_DevPanelSetFocusTic(int tic, int tic_size, const byte *current_cmd,
+                           const byte *original_cmd, boolean edited)
+{
+    int i;
+
+    devpanel_focus_tic = tic;
+    devpanel_focus_tic_size = tic_size;
+    devpanel_focus_edited = edited;
+    devpanel_focus_has_original = original_cmd != NULL && tic_size > 0;
+
+    for (i = 0; i < 5; ++i)
+    {
+        devpanel_focus_current[i] = 0;
+        devpanel_focus_original[i] = 0;
+    }
+
+    if (current_cmd != NULL)
+    {
+        for (i = 0; i < tic_size && i < 5; ++i)
+        {
+            devpanel_focus_current[i] = current_cmd[i];
+        }
+    }
+
+    if (original_cmd != NULL)
+    {
+        for (i = 0; i < tic_size && i < 5; ++i)
+        {
+            devpanel_focus_original[i] = original_cmd[i];
+        }
+    }
+}
+
+static void RenderDevPanel(SDL_Rect panel_rect)
+{
+    static const byte title_color[3] = { 240, 240, 240 };
+    static const byte body_color[3] = { 190, 198, 210 };
+    static const byte muted_color[3] = { 120, 126, 138 };
+    static const byte accent_color[3] = { 90, 175, 220 };
+    static const byte edited_color[3] = { 240, 90, 90 };
+    static const byte current_color[3] = { 120, 220, 140 };
+    char line[96];
+    int i;
+    int x;
+    int y;
+    int line_h;
+    int list_y;
+    int list_rows;
+    int tic_rows;
+    int fill_w;
+    int fwd;
+    int side;
+    int turn;
+    int buttons;
+    SDL_Rect dot1;
+    SDL_Rect dot2;
+    SDL_Rect dot3;
+    SDL_Rect progress_bg;
+    const byte *now_color;
+
+    SDL_SetRenderDrawColor(renderer, 18, 18, 22, SDL_ALPHA_OPAQUE);
+    SDL_RenderFillRect(renderer, &panel_rect);
+
+    SDL_SetRenderDrawColor(renderer, 70, 70, 76, SDL_ALPHA_OPAQUE);
+    SDL_RenderDrawLine(renderer, panel_rect.x, panel_rect.y,
+                       panel_rect.x, panel_rect.y + panel_rect.h);
+
+    // State indicator lights: paused/edit/seek
+    SDL_SetRenderDrawColor(renderer, devpanel_paused ? 220 : 60,
+                           devpanel_paused ? 200 : 60,
+                           60, SDL_ALPHA_OPAQUE);
+    dot1.x = panel_rect.x + 10;
+    dot1.y = panel_rect.y + 10;
+    dot1.w = 8;
+    dot1.h = 8;
+    SDL_RenderFillRect(renderer, &dot1);
+
+    SDL_SetRenderDrawColor(renderer, devpanel_edit_mode ? 80 : 60,
+                           devpanel_edit_mode ? 190 : 60,
+                           devpanel_edit_mode ? 220 : 60, SDL_ALPHA_OPAQUE);
+    dot2.x = panel_rect.x + 24;
+    dot2.y = panel_rect.y + 10;
+    dot2.w = 8;
+    dot2.h = 8;
+    SDL_RenderFillRect(renderer, &dot2);
+
+    SDL_SetRenderDrawColor(renderer, devpanel_seek_mode ? 240 : 60,
+                           devpanel_seek_mode ? 150 : 60,
+                           60, SDL_ALPHA_OPAQUE);
+    dot3.x = panel_rect.x + 38;
+    dot3.y = panel_rect.y + 10;
+    dot3.w = 8;
+    dot3.h = 8;
+    SDL_RenderFillRect(renderer, &dot3);
+
+    // Timeline progress strip.
+    SDL_SetRenderDrawColor(renderer, 52, 52, 58, SDL_ALPHA_OPAQUE);
+    progress_bg.x = panel_rect.x + 10;
+    progress_bg.y = panel_rect.y + 26;
+    progress_bg.w = panel_rect.w - 20;
+    progress_bg.h = 6;
+    SDL_RenderFillRect(renderer, &progress_bg);
+
+    fill_w = 0;
+
+    if (devpanel_total_tics > 0)
+    {
+        SDL_Rect progress_fg;
+
+        fill_w = (progress_bg.w * devpanel_current_tic) / devpanel_total_tics;
+
+        SDL_SetRenderDrawColor(renderer, 90, 175, 220, SDL_ALPHA_OPAQUE);
+        progress_fg.x = progress_bg.x;
+        progress_fg.y = progress_bg.y;
+        progress_fg.w = fill_w;
+        progress_fg.h = progress_bg.h;
+        SDL_RenderFillRect(renderer, &progress_fg);
+    }
+
+    x = panel_rect.x + 12;
+    y = panel_rect.y + 40;
+    line_h = 18;
+
+    DrawPanelText(x, y, 2, title_color[0], title_color[1], title_color[2],
+                  "DEMO DEBUG");
+    y += line_h;
+
+    M_snprintf(line, sizeof(line), "TIC %d/%d", devpanel_current_tic,
+               devpanel_total_tics);
+    DrawPanelText(x, y, 2, accent_color[0], accent_color[1], accent_color[2],
+                  line);
+    y += line_h;
+
+    M_snprintf(line, sizeof(line), "PAUSE %d EDIT %d SEEK %d",
+               devpanel_paused != 0, devpanel_edit_mode != 0,
+               devpanel_seek_mode != 0);
+    DrawPanelText(x, y, 2, body_color[0], body_color[1], body_color[2], line);
+    y += line_h;
+
+    DrawPanelText(x, y, 2, muted_color[0], muted_color[1], muted_color[2],
+                  devpanel_status);
+    y += line_h + 4;
+
+    DrawPanelText(x, y, 2, title_color[0], title_color[1], title_color[2],
+                  "FOCUS TIC");
+    y += line_h;
+
+    M_snprintf(line, sizeof(line), "%d %s", devpanel_focus_tic,
+               devpanel_focus_edited ? "[EDITED]" : "[ORIGINAL]");
+    DrawPanelText(x, y, 2,
+                  devpanel_focus_edited ? edited_color[0] : current_color[0],
+                  devpanel_focus_edited ? edited_color[1] : current_color[1],
+                  devpanel_focus_edited ? edited_color[2] : current_color[2],
+                  line);
+    y += line_h;
+
+    if (devpanel_focus_tic_size > 0)
+    {
+        if (devpanel_focus_tic_size >= 5)
+        {
+            M_snprintf(line, sizeof(line), "NOW %02X %02X %02X %02X %02X",
+                       devpanel_focus_current[0], devpanel_focus_current[1],
+                       devpanel_focus_current[2], devpanel_focus_current[3],
+                       devpanel_focus_current[4]);
+        }
+        else
+        {
+            M_snprintf(line, sizeof(line), "NOW %02X %02X %02X %02X",
+                       devpanel_focus_current[0], devpanel_focus_current[1],
+                       devpanel_focus_current[2], devpanel_focus_current[3]);
+        }
+        now_color = devpanel_focus_edited ? edited_color : body_color;
+        DrawPanelText(x, y, 2, now_color[0], now_color[1], now_color[2], line);
+        y += line_h;
+
+        if (devpanel_focus_has_original)
+        {
+            if (devpanel_focus_tic_size >= 5)
+            {
+                M_snprintf(line, sizeof(line), "ORG %02X %02X %02X %02X %02X",
+                           devpanel_focus_original[0], devpanel_focus_original[1],
+                           devpanel_focus_original[2], devpanel_focus_original[3],
+                           devpanel_focus_original[4]);
+            }
+            else
+            {
+                M_snprintf(line, sizeof(line), "ORG %02X %02X %02X %02X",
+                           devpanel_focus_original[0], devpanel_focus_original[1],
+                           devpanel_focus_original[2], devpanel_focus_original[3]);
+            }
+            DrawPanelText(x, y, 2, muted_color[0], muted_color[1],
+                          muted_color[2], line);
+            y += line_h;
+        }
+
+        fwd = (signed char) devpanel_focus_current[0];
+        side = (signed char) devpanel_focus_current[1];
+
+        if (devpanel_focus_tic_size >= 5)
+        {
+            turn = (short) (devpanel_focus_current[2]
+                 | (devpanel_focus_current[3] << 8));
+            buttons = devpanel_focus_current[4];
+        }
+        else
+        {
+            turn = (short) (devpanel_focus_current[2] << 8);
+            buttons = devpanel_focus_current[3];
+        }
+
+        M_snprintf(line, sizeof(line), "FWD %+d SID %+d TURN %+d",
+                   fwd, side, turn);
+        DrawPanelText(x, y, 2, body_color[0], body_color[1], body_color[2],
+                      line);
+        y += line_h;
+
+        BuildButtonSummary(line, sizeof(line), buttons);
+        DrawPanelText(x, y, 2, body_color[0], body_color[1], body_color[2],
+                      line);
+        y += line_h;
+    }
+
+    y += 4;
+    DrawPanelText(x, y, 2, title_color[0], title_color[1], title_color[2],
+                  "CONTROLS");
+    y += line_h;
+    DrawPanelText(x, y, 2, muted_color[0], muted_color[1], muted_color[2],
+                  "E TOGGLE EDIT  W SAVE");
+    y += line_h;
+    DrawPanelText(x, y, 2, muted_color[0], muted_color[1], muted_color[2],
+                  "[ ] SEEK  P PAUSE");
+    y += line_h;
+    DrawPanelText(x, y, 2, muted_color[0], muted_color[1], muted_color[2],
+                  "ARROWS TURN/FWD  , . SIDE");
+    y += line_h;
+    DrawPanelText(x, y, 2, muted_color[0], muted_color[1], muted_color[2],
+                  "F ATTACK  U USE  1-7 WEAPON");
+    y += line_h + 4;
+
+    DrawPanelText(x, y, 2, title_color[0], title_color[1], title_color[2],
+                  "RECENT TICS");
+    y += line_h;
+
+    list_y = y;
+    tic_rows = devpanel_tics_count;
+    list_rows = (panel_rect.h - list_y - 12) / line_h;
+
+    if (tic_rows > list_rows)
+    {
+        tic_rows = list_rows;
+    }
+
+    for (i = tic_rows - 1; i >= 0; --i)
+    {
+        int idx = (devpanel_tics_write - tic_rows + i + DEVPANEL_MAX_TICS)
+                % DEVPANEL_MAX_TICS;
+        i_devpanel_tic_t tic = devpanel_tics[idx];
+        const byte *row_color;
+
+        if (tic.tic == devpanel_focus_tic)
+        {
+            row_color = current_color;
+        }
+        else if (tic.edited)
+        {
+            row_color = edited_color;
+        }
+        else
+        {
+            row_color = body_color;
+        }
+
+        M_snprintf(line, sizeof(line), "%c%05d %+03d %+03d %+05d %02X",
+                   tic.tic == devpanel_focus_tic ? '>' : ' ',
+                   tic.tic,
+                   tic.forwardmove,
+                   tic.sidemove,
+                   tic.angleturn,
+                   tic.buttons);
+        DrawPanelText(x, y, 2, row_color[0], row_color[1], row_color[2], line);
+        y += line_h;
+    }
+}
 
 static boolean MouseShouldBeGrabbed()
 {

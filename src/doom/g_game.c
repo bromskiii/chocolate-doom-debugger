@@ -77,6 +77,8 @@
 
 
 #define SAVEGAMESIZE	0x2c000
+#define DEVPANEL_HISTORY_SIZE 256
+#define DEMOMARKER              0x80
 
 void	G_ReadDemoTiccmd (ticcmd_t* cmd); 
 void	G_WriteDemoTiccmd (ticcmd_t* cmd); 
@@ -140,6 +142,24 @@ byte*		demobuffer;
 byte*		demo_p;
 byte*		demoend; 
 boolean         singledemo;            	// quit after playing a demo from cmdline 
+
+static boolean  demo_devpanel_enabled = false;
+static boolean  demo_edit_mode = false;
+static boolean  demo_seek_active = false;
+static boolean  demo_seek_restore_paused = false;
+static boolean  demo_seek_restore_nodrawers = false;
+static boolean  demo_seek_restore_singletics = false;
+static int      demo_seek_target_tic = 0;
+static int      demo_current_tic = 0;
+static int      demo_total_tics = 0;
+static int      demo_tic_size = 4;
+static byte    *demo_start_p = NULL;
+static byte    *demo_original_data = NULL;
+static char     demo_status_line[96];
+
+static g_devpanel_tic_t demo_recent_tics[DEVPANEL_HISTORY_SIZE];
+static int      demo_recent_write = 0;
+static int      demo_recent_count = 0;
  
 boolean         precache = true;        // if true, load all graphics at start 
 
@@ -232,6 +252,372 @@ int		bodyqueslot;
  
 int             vanilla_savegame_limit = 1;
 int             vanilla_demo_limit = 1;
+
+static byte *G_DemoTicPointer(int tic);
+
+static void G_SetDemoStatus(const char *text)
+{
+    M_StringCopy(demo_status_line, text, sizeof(demo_status_line));
+    I_DevPanelSetStatus(demo_status_line);
+
+    if (demoplayback && playeringame[consoleplayer])
+    {
+        players[consoleplayer].message = demo_status_line;
+    }
+}
+
+static void G_PushDemoTicToHistory(int tic, const ticcmd_t *cmd)
+{
+    g_devpanel_tic_t *entry = &demo_recent_tics[demo_recent_write];
+    i_devpanel_tic_t panel_tic;
+
+    entry->tic = tic;
+    entry->forwardmove = cmd->forwardmove;
+    entry->sidemove = cmd->sidemove;
+    entry->angleturn = cmd->angleturn;
+    entry->buttons = cmd->buttons;
+    entry->edited = false;
+
+    panel_tic.tic = tic;
+    panel_tic.forwardmove = cmd->forwardmove;
+    panel_tic.sidemove = cmd->sidemove;
+    panel_tic.angleturn = cmd->angleturn;
+    panel_tic.buttons = cmd->buttons;
+    panel_tic.edited = false;
+    I_DevPanelPushTic(panel_tic);
+
+    demo_recent_write = (demo_recent_write + 1) % DEVPANEL_HISTORY_SIZE;
+
+    if (demo_recent_count < DEVPANEL_HISTORY_SIZE)
+    {
+        ++demo_recent_count;
+    }
+}
+
+static void G_MarkDemoTicEdited(int tic)
+{
+    int i;
+
+    I_DevPanelMarkTicEdited(tic);
+
+    for (i = 0; i < demo_recent_count; ++i)
+    {
+        int idx = (demo_recent_write - 1 - i + DEVPANEL_HISTORY_SIZE)
+                % DEVPANEL_HISTORY_SIZE;
+
+        if (demo_recent_tics[idx].tic == tic)
+        {
+            demo_recent_tics[idx].edited = true;
+            break;
+        }
+    }
+}
+
+static int G_ClampEditableDemoTic(int tic)
+{
+    if (demo_total_tics <= 0)
+    {
+        return 0;
+    }
+
+    if (tic < 0)
+    {
+        return 0;
+    }
+
+    if (tic >= demo_total_tics)
+    {
+        return demo_total_tics - 1;
+    }
+
+    return tic;
+}
+
+static void G_UpdateFocusedDemoTic(void)
+{
+    int focus_tic;
+    byte *current_tic_data;
+    byte *original_tic_data;
+    boolean edited;
+
+    if (!demoplayback || demo_start_p == NULL || demo_total_tics <= 0)
+    {
+        I_DevPanelSetFocusTic(0, 0, NULL, NULL, false);
+        return;
+    }
+
+    focus_tic = G_ClampEditableDemoTic(demo_current_tic);
+    current_tic_data = G_DemoTicPointer(focus_tic);
+    original_tic_data = NULL;
+
+    if (demo_original_data != NULL)
+    {
+        original_tic_data = demo_original_data + focus_tic * demo_tic_size;
+    }
+
+    edited = false;
+
+    if (current_tic_data != NULL && original_tic_data != NULL)
+    {
+        edited = memcmp(current_tic_data, original_tic_data, demo_tic_size) != 0;
+    }
+
+    I_DevPanelSetFocusTic(focus_tic, demo_tic_size, current_tic_data,
+                          original_tic_data, edited);
+}
+
+static void G_SyncDevPanelState(void)
+{
+    I_DevPanelSetEnabled(demoplayback && demo_devpanel_enabled);
+    I_DevPanelSetFlags(paused, demo_edit_mode, demo_seek_active);
+    I_DevPanelSetTimeline(demo_current_tic, demo_total_tics);
+    G_UpdateFocusedDemoTic();
+}
+
+static byte *G_DemoTicPointer(int tic)
+{
+    if (demo_start_p == NULL || tic < 0 || tic >= demo_total_tics)
+    {
+        return NULL;
+    }
+
+    return demo_start_p + tic * demo_tic_size;
+}
+
+static int G_CalcDemoTotalTics(void)
+{
+    byte *p;
+    int count;
+
+    if (demo_start_p == NULL)
+    {
+        return 0;
+    }
+
+    p = demo_start_p;
+    count = 0;
+
+    while (*p != DEMOMARKER)
+    {
+        p += demo_tic_size;
+        ++count;
+    }
+
+    return count;
+}
+
+static int G_ClampDemoTic(int tic)
+{
+    if (tic < 0)
+    {
+        return 0;
+    }
+
+    if (tic > demo_total_tics)
+    {
+        return demo_total_tics;
+    }
+
+    return tic;
+}
+
+static void G_ResetDemoToStart(void)
+{
+    G_InitNew(gameskill, gameepisode, gamemap);
+    usergame = false;
+    demoplayback = true;
+    paused = false;
+    demo_p = demo_start_p;
+    demo_current_tic = 0;
+}
+
+static void G_StopDemoSeek(void)
+{
+    demo_seek_active = false;
+    nodrawers = demo_seek_restore_nodrawers;
+    singletics = demo_seek_restore_singletics;
+    paused = demo_seek_restore_paused;
+
+    G_SyncDevPanelState();
+    G_SetDemoStatus("Seek complete");
+}
+
+static void G_RequestDemoSeek(int delta_tics)
+{
+    int target;
+
+    if (!demoplayback || demo_start_p == NULL)
+    {
+        return;
+    }
+
+    target = G_ClampDemoTic(demo_current_tic + delta_tics);
+
+    if (target == demo_current_tic)
+    {
+        return;
+    }
+
+    if (target < demo_current_tic)
+    {
+        G_ResetDemoToStart();
+    }
+
+    if (target > demo_current_tic)
+    {
+        demo_seek_target_tic = target;
+        demo_seek_restore_paused = paused;
+        demo_seek_restore_nodrawers = nodrawers;
+        demo_seek_restore_singletics = singletics;
+
+        paused = false;
+        nodrawers = true;
+        singletics = true;
+        demo_seek_active = true;
+
+        G_SyncDevPanelState();
+        G_SetDemoStatus("Seeking...");
+    }
+}
+
+static int G_ReadDemoAngleFromBytes(const byte *tic_data)
+{
+    if (longtics)
+    {
+        return (int) tic_data[2] | ((int) tic_data[3] << 8);
+    }
+
+    return ((int) tic_data[2]) << 8;
+}
+
+static void G_WriteDemoAngleToBytes(byte *tic_data, int angle)
+{
+    if (longtics)
+    {
+        tic_data[2] = angle & 0xff;
+        tic_data[3] = (angle >> 8) & 0xff;
+    }
+    else
+    {
+        tic_data[2] = (angle >> 8) & 0xff;
+    }
+}
+
+static int G_SaveEditedDemo(void)
+{
+    byte *p;
+    int len;
+
+    if (!demoplayback || demobuffer == NULL || demo_start_p == NULL)
+    {
+        return 0;
+    }
+
+    p = demo_start_p;
+
+    while (*p != DEMOMARKER)
+    {
+        p += demo_tic_size;
+    }
+
+    len = (p - demobuffer) + 1;
+
+    if (!M_WriteFile("demo_edited.lmp", demobuffer, len))
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+static void G_DemoEditCurrentTic(event_t *ev)
+{
+    byte *tic_data;
+    int tic_to_edit;
+    int value;
+    int button_index;
+
+    tic_to_edit = G_ClampEditableDemoTic(demo_current_tic);
+    tic_data = G_DemoTicPointer(tic_to_edit);
+
+    if (tic_data == NULL)
+    {
+        return;
+    }
+
+    switch (ev->data1)
+    {
+        case KEY_UPARROW:
+            value = (signed char) tic_data[0];
+            if (value < 127)
+            {
+                tic_data[0] = (byte) (value + 1);
+            }
+            break;
+
+        case KEY_DOWNARROW:
+            value = (signed char) tic_data[0];
+            if (value > -128)
+            {
+                tic_data[0] = (byte) (value - 1);
+            }
+            break;
+
+        case ',':
+            value = (signed char) tic_data[1];
+            if (value > -128)
+            {
+                tic_data[1] = (byte) (value - 1);
+            }
+            break;
+
+        case '.':
+            value = (signed char) tic_data[1];
+            if (value < 127)
+            {
+                tic_data[1] = (byte) (value + 1);
+            }
+            break;
+
+        case KEY_LEFTARROW:
+            value = G_ReadDemoAngleFromBytes(tic_data);
+            G_WriteDemoAngleToBytes(tic_data, value + 0x80);
+            break;
+
+        case KEY_RIGHTARROW:
+            value = G_ReadDemoAngleFromBytes(tic_data);
+            G_WriteDemoAngleToBytes(tic_data, value - 0x80);
+            break;
+
+        case 'f':
+        case 'F':
+            tic_data[demo_tic_size - 1] ^= BT_ATTACK;
+            break;
+
+        case 'u':
+        case 'U':
+            tic_data[demo_tic_size - 1] ^= BT_USE;
+            break;
+
+        default:
+            if (ev->data1 >= '1' && ev->data1 <= '7')
+            {
+                button_index = ev->data1 - '1';
+                tic_data[demo_tic_size - 1] &= ~BT_WEAPONMASK;
+                tic_data[demo_tic_size - 1] |= BT_CHANGE;
+                tic_data[demo_tic_size - 1] |= button_index << BT_WEAPONSHIFT;
+            }
+            else
+            {
+                return;
+            }
+            break;
+    }
+
+    G_MarkDemoTicEdited(tic_to_edit);
+    G_SetDemoStatus("Edited current tic");
+    G_UpdateFocusedDemoTic();
+}
  
 int G_CmdChecksum (ticcmd_t* cmd) 
 { 
@@ -787,6 +1173,84 @@ static void SetMouseButtons(unsigned int buttons_mask)
 // 
 boolean G_Responder (event_t* ev) 
 { 
+    if (demoplayback && ev->type == ev_keydown)
+    {
+        if (ev->data1 == KEY_F12)
+        {
+            demo_devpanel_enabled = !demo_devpanel_enabled;
+            G_SyncDevPanelState();
+            G_SetDemoStatus(demo_devpanel_enabled
+                            ? "Dev panel enabled"
+                            : "Dev panel disabled");
+            return true;
+        }
+
+        if (ev->data1 == '[')
+        {
+            G_RequestDemoSeek(-5 * TICRATE);
+            return true;
+        }
+
+        if (ev->data1 == ']')
+        {
+            G_RequestDemoSeek(5 * TICRATE);
+            return true;
+        }
+
+        if (ev->data1 == 'p' || ev->data1 == 'P' || ev->data1 == KEY_PAUSE)
+        {
+            paused = !paused;
+
+            if (paused)
+            {
+                S_PauseSound();
+            }
+            else
+            {
+                S_ResumeSound();
+            }
+
+            G_SyncDevPanelState();
+
+            return true;
+        }
+
+        if (ev->data1 == 'e' || ev->data1 == 'E')
+        {
+            demo_edit_mode = !demo_edit_mode;
+            paused = demo_edit_mode;
+
+            if (paused)
+            {
+                S_PauseSound();
+            }
+            else
+            {
+                S_ResumeSound();
+            }
+
+            G_SyncDevPanelState();
+            G_SetDemoStatus(demo_edit_mode
+                            ? "Edit mode enabled"
+                            : "Edit mode disabled");
+            return true;
+        }
+
+        if (ev->data1 == 'w' || ev->data1 == 'W')
+        {
+            G_SetDemoStatus(G_SaveEditedDemo()
+                            ? "Saved demo_edited.lmp"
+                            : "Save failed");
+            return true;
+        }
+
+        if (demo_edit_mode && paused)
+        {
+            G_DemoEditCurrentTic(ev);
+            return true;
+        }
+    }
+
     // allow spy mode changes even during the demo
     if (gamestate == GS_LEVEL && ev->type == ev_keydown 
      && ev->data1 == key_spy && (singledemo || !deathmatch) )
@@ -1970,17 +2434,19 @@ G_InitNew
 //
 // DEMO RECORDING 
 // 
-#define DEMOMARKER		0x80
-
-
 void G_ReadDemoTiccmd (ticcmd_t* cmd) 
 { 
+    int tic_index;
+
     if (*demo_p == DEMOMARKER) 
     {
 	// end of demo data stream 
 	G_CheckDemoStatus (); 
 	return; 
     } 
+
+    tic_index = demo_current_tic;
+
     cmd->forwardmove = ((signed char)*demo_p++); 
     cmd->sidemove = ((signed char)*demo_p++); 
 
@@ -1997,6 +2463,16 @@ void G_ReadDemoTiccmd (ticcmd_t* cmd)
     }
 
     cmd->buttons = (unsigned char)*demo_p++; 
+
+    G_PushDemoTicToHistory(tic_index, cmd);
+    ++demo_current_tic;
+
+    if (demo_seek_active && demo_current_tic >= demo_seek_target_tic)
+    {
+        G_StopDemoSeek();
+    }
+
+    G_SyncDevPanelState();
 } 
 
 // Increase the size of the demo buffer to allow unlimited demos
@@ -2312,6 +2788,38 @@ void G_DoPlayDemo (void)
 
     usergame = false; 
     demoplayback = true; 
+
+    demo_devpanel_enabled = true;
+    demo_edit_mode = false;
+    demo_seek_active = false;
+    demo_recent_count = 0;
+    demo_recent_write = 0;
+    demo_current_tic = 0;
+    demo_tic_size = longtics ? 5 : 4;
+    demo_start_p = demo_p;
+    demo_total_tics = G_CalcDemoTotalTics();
+
+    if (demo_original_data != NULL)
+    {
+        free(demo_original_data);
+        demo_original_data = NULL;
+    }
+
+    if (demo_total_tics > 0)
+    {
+        demo_original_data = malloc(demo_total_tics * demo_tic_size);
+
+        if (demo_original_data != NULL)
+        {
+            memcpy(demo_original_data, demo_start_p,
+                   demo_total_tics * demo_tic_size);
+        }
+    }
+
+    M_snprintf(demo_status_line, sizeof(demo_status_line),
+               "Demo loaded (%d tics)", demo_total_tics);
+    I_DevPanelSetStatus(demo_status_line);
+    G_SyncDevPanelState();
 } 
 
 //
@@ -2369,6 +2877,22 @@ boolean G_CheckDemoStatus (void)
 	 
     if (demoplayback) 
     { 
+        demo_seek_active = false;
+        demo_edit_mode = false;
+        demo_start_p = NULL;
+        demo_total_tics = 0;
+        demo_current_tic = 0;
+        demo_recent_count = 0;
+        demo_recent_write = 0;
+
+        if (demo_original_data != NULL)
+        {
+            free(demo_original_data);
+            demo_original_data = NULL;
+        }
+
+        G_SyncDevPanelState();
+
         W_ReleaseLumpName(defdemoname);
 	demoplayback = false; 
 	netdemo = false;
@@ -2399,6 +2923,63 @@ boolean G_CheckDemoStatus (void)
 	 
     return false; 
 } 
+
+    boolean G_DevPanelEnabled(void)
+    {
+        return demoplayback && demo_devpanel_enabled;
+    }
+
+    boolean G_DevPanelEditMode(void)
+    {
+        return demoplayback && demo_edit_mode;
+    }
+
+    boolean G_DevPanelSeekActive(void)
+    {
+        return demoplayback && demo_seek_active;
+    }
+
+    int G_DevPanelCurrentTic(void)
+    {
+        return demo_current_tic;
+    }
+
+    int G_DevPanelTotalTics(void)
+    {
+        return demo_total_tics;
+    }
+
+    int G_DevPanelCopyRecentTics(g_devpanel_tic_t *out, int max)
+    {
+        int copy_count;
+        int i;
+
+        if (out == NULL || max <= 0)
+        {
+            return 0;
+        }
+
+        copy_count = demo_recent_count;
+
+        if (copy_count > max)
+        {
+            copy_count = max;
+        }
+
+        for (i = 0; i < copy_count; ++i)
+        {
+            int src_idx = (demo_recent_write - copy_count + i + DEVPANEL_HISTORY_SIZE)
+                        % DEVPANEL_HISTORY_SIZE;
+            out[i] = demo_recent_tics[src_idx];
+        }
+
+        return copy_count;
+    }
+
+    const char *G_DevPanelStatus(void)
+    {
+        return demo_status_line;
+    }
  
  
  

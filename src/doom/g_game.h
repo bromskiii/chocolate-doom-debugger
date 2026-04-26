@@ -25,6 +25,16 @@
 #include "d_ticcmd.h"
 #include "m_fixed.h"
 
+typedef struct
+{
+	int tic;
+	signed char forwardmove;
+	signed char sidemove;
+	short angleturn;
+	unsigned char buttons;
+	boolean edited;
+} g_devpanel_tic_t;
+
 
 //
 // GAME
@@ -58,6 +68,14 @@ void G_PlayDemo (char* name);
 void G_TimeDemo (char* name);
 boolean G_CheckDemoStatus (void);
 
+boolean G_DevPanelEnabled(void);
+boolean G_DevPanelEditMode(void);
+boolean G_DevPanelSeekActive(void);
+int G_DevPanelCurrentTic(void);
+int G_DevPanelTotalTics(void);
+int G_DevPanelCopyRecentTics(g_devpanel_tic_t *out, int max);
+const char *G_DevPanelStatus(void);
+
 void G_ExitLevel (void);
 void G_SecretExitLevel (void);
 
@@ -85,4 +103,3 @@ extern boolean sendpause;
 
 
 #endif
-

@@ -33,6 +33,16 @@
 
 typedef boolean (*grabmouse_callback_t)(void);
 
+typedef struct
+{
+	int tic;
+	signed char forwardmove;
+	signed char sidemove;
+	short angleturn;
+	unsigned char buttons;
+	boolean edited;
+} i_devpanel_tic_t;
+
 // Called by D_DoomMain,
 // determines the hardware configuration
 // and sets up the video mode
@@ -78,6 +88,15 @@ void I_StartTic (void);
 // Enable the loading disk image displayed when reading from disk.
 
 void I_EnableLoadingDisk(int xoffs, int yoffs);
+
+void I_DevPanelSetEnabled(boolean enabled);
+void I_DevPanelSetFlags(boolean paused, boolean edit_mode, boolean seek_mode);
+void I_DevPanelSetTimeline(int current_tic, int total_tics);
+void I_DevPanelSetStatus(const char *status);
+void I_DevPanelPushTic(i_devpanel_tic_t tic);
+void I_DevPanelMarkTicEdited(int tic);
+void I_DevPanelSetFocusTic(int tic, int tic_size, const byte *current_cmd,
+                           const byte *original_cmd, boolean edited);
 
 extern char *video_driver;
 extern boolean screenvisible;

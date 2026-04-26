@@ -497,11 +497,8 @@ EV_BuildStairs
 	height = sec->floorheight + stairsize;
 	floor->floordestheight = height;
 	// Initialize
-	floor->type = lowerFloor;
-	// e6y
-	// Uninitialized crush field will not be equal to 0 or 1 (true)
-	// with high probability. So, initialize it with any other value
-	floor->crush = STAIRS_UNINITIALIZED_CRUSH_FIELD_VALUE;
+	// The crush field is not initialized.
+	floor->type = lowerFloor; 
 		
 	texture = sec->floorpic;
 	
@@ -546,11 +543,8 @@ EV_BuildStairs
 		floor->speed = speed;
 		floor->floordestheight = height;
 		// Initialize
-		floor->type = lowerFloor;
-		// e6y
-		// Uninitialized crush field will not be equal to 0 or 1 (true)
-		// with high probability. So, initialize it with any other value
-		floor->crush = STAIRS_UNINITIALIZED_CRUSH_FIELD_VALUE;
+		// The crush field is not initialized.
+		floor->type = lowerFloor; 
 		ok = 1;
 		break;
 	    }
@@ -558,4 +552,3 @@ EV_BuildStairs
     }
     return rtn;
 }
-
